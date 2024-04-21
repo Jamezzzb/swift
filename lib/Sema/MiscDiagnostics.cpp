@@ -2718,6 +2718,10 @@ class VarDeclUsageChecker : public ASTWalker {
   /// occur in, when they are in a pattern in a StmtCondition.
   llvm::SmallDenseMap<VarDecl*, LabeledConditionalStmt*> StmtConditionForVD;
 
+  /// A mapping from TuplePatterns to the VarDecls that occur in them.
+  /// Ignores single element tuples.
+  llvm::SmallDenseMap<TuplePattern*, SmallVector<VarDecl*>> TupleVarDecls;
+
 #ifndef NDEBUG
   llvm::SmallPtrSet<Expr*, 32> AllExprsSeen;
 #endif
@@ -2788,6 +2792,10 @@ public:
   void markBaseOfStorageUse(Expr *E, bool isMutating);
   
   void markStoredOrInOutExpr(Expr *E, unsigned Flags);
+
+  /// If the `VarDecl` occurs in a `TuplePattern`,
+  /// look through the whole tuple and see what diagnostics we need to emit.
+  unsigned checkUsageInTuple(VarDecl* VD);
 
   MacroWalking getMacroWalkingBehavior() const override {
     return MacroWalking::ArgumentsAndExpansion;
@@ -2935,6 +2943,28 @@ public:
     }
 
     return Action::Continue(S);
+  }
+
+  PreWalkResult<Pattern *> walkToPatternPre(Pattern *P) override {
+    if (auto *TP = dyn_cast<TuplePattern>(P)) {
+      SmallVector<VarDecl*> vars;
+      bool hasAnyVarNotMutated = false;
+      TP->forEachVariable([&](VarDecl *VD) {
+        // We want to deal with the case where a user has writen something like:
+        // 'for var (i, elt) in s.enumerated()' and only mutates `elt`.
+        // The fix it will need to be: `for (i, var elt) in s.enumerated()`.
+        // Otherwise we can ignore and fallback on the usual diagnostics.
+        if (!(VarDecls[VD] & RK_Written) && !(VD->isLet())) {
+          hasAnyVarNotMutated = true;
+        }
+        vars.emplace_back(VD);
+      });
+      if (hasAnyVarNotMutated && vars.size() > 1) {
+        auto it = TupleVarDecls[TP].begin();
+        TupleVarDecls[TP].insert(it, vars.begin(), vars.end());
+      }
+    }
+    return Action::Continue(P);
   }
 };
   
@@ -3385,10 +3415,10 @@ VarDeclUsageChecker::~VarDeclUsageChecker() {
   if (sawError)
     return;
 
-  for (auto p : VarDecls) {
+  for (auto it = VarDecls.begin(); it < VarDecls.end(); it++) {
     VarDecl *var;
     unsigned access;
-    std::tie(var, access) = p;
+    std::tie(var, access) = *it;
 
     // If the variable was not defined in this scope, we can safely ignore it.
     if (!(access & RK_Defined))
@@ -3445,6 +3475,15 @@ VarDeclUsageChecker::~VarDeclUsageChecker() {
     if (var->getInterfaceType()->is<WeakStorageType>())
       access |= RK_Written;
     
+    // If this variable occurs in a TuplePattern,
+    // diagnose it and others together;
+    // doing so may require restructuring the pattern.
+    auto dist = checkUsageInTuple(var);
+    if (dist > 0) {
+      std::advance(it, dist);
+      continue;
+    }
+
     // Diagnose variables that were never used (other than their
     // initialization).
     //
@@ -3906,6 +3945,60 @@ void VarDeclUsageChecker::handleIfConfig(IfConfigDecl *ICD) {
     for (auto elt : clause.Elements)
       elt.walk(ConservativeDeclMarker(*this));
   }
+}
+
+unsigned VarDeclUsageChecker::checkUsageInTuple(VarDecl* VD) {
+  if (auto *pattern = VD->getParentPattern()) {
+    TuplePattern* TP = nullptr;
+    SourceLoc FixItLoc;
+    pattern->forEachNode([&](Pattern *P) {
+      if (auto BP = dyn_cast<BindingPattern>(P)) {
+        if (auto foundTP = dyn_cast<TuplePattern>(BP->getSubPattern())) {
+          if (!TP) {
+            TP = foundTP;
+            FixItLoc = BP->getLoc();
+          }
+        }
+      }
+    });
+    if (TP) {
+      SmallVector<std::pair<SourceLoc, std::string>> fixIts;
+      std::optional<InFlightDiagnostic> diagOpt;
+      for (auto &elt: TupleVarDecls[TP]) {
+        // flush the current diagnostic so we can emit a new one.
+        if (!(VarDecls[elt] & (RK_Written & RK_Read)))
+          diagOpt.reset();
+        if (VarDecls[elt] & (RK_Written | RK_Read)) {
+          if (!(VarDecls[elt] & RK_Written)) {
+            diagOpt.emplace(Diags.diagnose(elt->getLoc(),
+                                           diag::variable_never_mutated,
+                                           elt->getName(), false));
+            continue;
+          } else if (!(VarDecls[elt] & RK_Read)) {
+            diagOpt.emplace(Diags.diagnose(elt->getLoc(),
+                                           diag::variable_never_read,
+                                           elt->getName()));
+          }
+          fixIts.emplace_back(elt->getLoc(), "var " + elt->getNameStr().str());
+        } else {
+          diagOpt.emplace(Diags.diagnose(elt->getLoc(),
+                                         diag::variable_never_used,
+                                         elt->getName(), false));
+          fixIts.emplace_back(elt->getLoc(), "_");
+        }
+      }
+      if (!FixItLoc.isInvalid() && diagOpt.has_value()) {
+        auto &diag = *diagOpt;
+        diag.fixItRemove(FixItLoc);
+        for (auto &[loc, str]: fixIts) {
+          diag.fixItReplace(loc, str);
+        }
+        diag.fixItReplace(TP->getRParenLoc(), ")");
+      }
+      return TupleVarDecls[TP].size();
+    }
+  }
+  return 0;
 }
 
 namespace {
